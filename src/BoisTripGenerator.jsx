@@ -283,11 +283,12 @@ export default function BoisTripGenerator() {
   const [progressChars, setProgressChars] = useState(0);
   const [error, setError] = useState(null);
 
-  // Dynamically load html2canvas for share-as-image feature
+  // Dynamically load html-to-image for share-as-image feature
+  // (much better modern CSS support than html2canvas, which garbles colors)
   useEffect(() => {
-    if (typeof window === "undefined" || window.html2canvas) return;
+    if (typeof window === "undefined" || window.htmlToImage) return;
     const script = document.createElement("script");
-    script.src = "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js";
+    script.src = "https://cdn.jsdelivr.net/npm/html-to-image@1.11.11/dist/html-to-image.min.js";
     script.async = true;
     document.body.appendChild(script);
   }, []);
@@ -1399,53 +1400,56 @@ function ResultsScreen({ recs, prefs, shareState, onReroll, onRemix, onReset }) 
     }
   };
 
-  // Use html2canvas to snapshot the full plan as an image
+  // Use html-to-image to snapshot the full plan as a PNG.
+  // html-to-image works by serializing DOM to SVG then rasterizing — handles
+  // modern CSS, custom fonts, and dark-on-dark blocks correctly (unlike html2canvas).
   const snapshotToImage = async (targetRef, filenameSuffix) => {
-    if (typeof window === "undefined" || !window.html2canvas || !targetRef.current) {
+    if (typeof window === "undefined" || !window.htmlToImage || !targetRef.current) {
       setShareMsg("STILL LOADING — TRY IN 2 SEC");
       setTimeout(() => setShareMsg(null), 2200);
       return;
     }
     setShareMsg("RENDERING IMAGE...");
     try {
-      const canvas = await window.html2canvas(targetRef.current, {
+      const node = targetRef.current;
+      const blob = await window.htmlToImage.toBlob(node, {
         backgroundColor: PALETTE.cream,
-        scale: 2,
-        useCORS: true,
-        logging: false,
+        pixelRatio: 2,
+        cacheBust: true,
+        // Filter out any interactive-only elements if present (none right now)
+        filter: (n) => !(n.dataset && n.dataset.exclude === "true"),
       });
-      canvas.toBlob(async (blob) => {
-        if (!blob) { setShareMsg("RENDER FAILED"); return; }
 
-        // Try native Web Share (mobile) first — best for texting
-        const file = new File([blob], `boistrip-${filenameSuffix}.png`, { type: "image/png" });
-        if (navigator.canShare && navigator.canShare({ files: [file] })) {
-          try {
-            await navigator.share({ files: [file], title: "Bois Trip" });
-            setShareMsg("SHARED ✓");
-            setTimeout(() => setShareMsg(null), 2000);
-            return;
-          } catch (e) {
-            // User cancelled; fall through to download
-          }
+      if (!blob) { setShareMsg("RENDER FAILED"); return; }
+
+      // Try native Web Share (mobile) first — best for texting
+      const file = new File([blob], `boistrip-${filenameSuffix}.png`, { type: "image/png" });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        try {
+          await navigator.share({ files: [file], title: "Bois Trip" });
+          setShareMsg("SHARED ✓");
+          setTimeout(() => setShareMsg(null), 2000);
+          return;
+        } catch (e) {
+          // User cancelled; fall through to download
         }
+      }
 
-        // Fallback: download the image
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `boistrip-${filenameSuffix}.png`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        setShareMsg("IMAGE DOWNLOADED ✓");
-        setTimeout(() => setShareMsg(null), 2200);
-      }, "image/png");
+      // Fallback: download the image
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `boistrip-${filenameSuffix}.png`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setShareMsg("IMAGE DOWNLOADED ✓");
+      setTimeout(() => setShareMsg(null), 2200);
     } catch (e) {
       console.error(e);
-      setShareMsg("RENDER FAILED");
-      setTimeout(() => setShareMsg(null), 2200);
+      setShareMsg("RENDER FAILED — try the copy link instead");
+      setTimeout(() => setShareMsg(null), 3000);
     }
   };
 
