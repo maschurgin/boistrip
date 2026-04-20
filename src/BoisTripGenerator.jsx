@@ -165,7 +165,14 @@ Return ONLY valid JSON in this exact format (no markdown, no preamble, no code f
   ]
 }
 
-Return exactly 4 recommendations. Order them best-fit first, factoring in travel logistics, seasonal fit, and overall vibe match.`;
+Return exactly 4 recommendations. Order them best-fit first, factoring in travel logistics, seasonal fit, and overall vibe match.
+
+🚨 FORMAT RULES (STRICT):
+- Output ONLY the JSON object. No preamble like "Here are..." or "Sure!".
+- No comments, no trailing text, no markdown code fences, no explanation after the JSON.
+- The first character of your response must be { and the last must be }.
+- All strings must be valid JSON strings (escape any double quotes inside strings with \\").
+- Do not add trailing commas.`;
 
   const requestBody = {
     model: "claude-haiku-4-5",
@@ -238,13 +245,62 @@ Return exactly 4 recommendations. Order them best-fit first, factoring in travel
     .replace(/```\s*/g, "")
     .trim();
 
-  const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
-    throw new Error("No JSON found in streamed response");
+  // Extract the outermost JSON object by tracking brace depth.
+  // This is more reliable than regex because small models (Haiku) sometimes
+  // append stray text or comments after the final } which breaks JSON.parse.
+  const extractJSON = (text) => {
+    const start = text.indexOf("{");
+    if (start === -1) return null;
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (escape) { escape = false; continue; }
+      if (ch === "\\") { escape = true; continue; }
+      if (ch === '"') { inString = !inString; continue; }
+      if (inString) continue;
+      if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) return text.slice(start, i + 1);
+      }
+    }
+    // If we got here, JSON was truncated — try closing with stubs
+    return null;
+  };
+
+  let jsonStr = extractJSON(cleaned);
+
+  if (!jsonStr) {
+    // Last-resort repair: strip incomplete trailing object/array entries and close brackets
+    let repaired = cleaned.slice(cleaned.indexOf("{"));
+    // Chop at the last complete closing `}` of what looks like a rec entry
+    const lastCompleteObj = repaired.lastIndexOf('"},');
+    if (lastCompleteObj !== -1) {
+      repaired = repaired.slice(0, lastCompleteObj + 2) + "]}";
+      jsonStr = extractJSON(repaired);
+    }
   }
 
-  const parsed = JSON.parse(jsonMatch[0]);
-  return parsed.recommendations || [];
+  if (!jsonStr) {
+    console.error("Raw response that failed to parse:", fullText.slice(0, 500));
+    throw new Error("Response was malformed JSON. Try again — small models occasionally flub the format.");
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonStr);
+  } catch (e) {
+    console.error("JSON parse failed on:", jsonStr.slice(0, 500));
+    throw new Error("Response couldn't be parsed. Try again.");
+  }
+
+  const recs = parsed.recommendations || [];
+  if (recs.length === 0) {
+    throw new Error("Got a valid response but no recommendations in it. Try again.");
+  }
+  return recs;
 }
 
 // ============================================================
