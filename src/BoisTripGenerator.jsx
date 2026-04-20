@@ -77,7 +77,7 @@ const fontStyles = `
 // LLM RECOMMENDATION ENGINE
 // ============================================================
 
-async function generateRecommendations(prefs, useWebSearch = true) {
+async function generateRecommendations(prefs, useWebSearch = true, onProgress = null) {
   const boisCount = prefs.bois.length;
   const boisList = prefs.bois.map(b => `${b.name} (lives in ${b.home})`).join(", ");
 
@@ -168,7 +168,7 @@ Return ONLY valid JSON in this exact format (no markdown, no preamble, no code f
 Return exactly 4 recommendations. Order them best-fit first, factoring in travel logistics, seasonal fit, and overall vibe match.`;
 
   const requestBody = {
-    model: "claude-sonnet-4-6",
+    model: "claude-sonnet-4-20250514",
     max_tokens: 4000,
     messages: [{ role: "user", content: prompt }],
   };
@@ -177,8 +177,8 @@ Return exactly 4 recommendations. Order them best-fit first, factoring in travel
     requestBody.tools = [{ type: "web_search_20250305", name: "web_search" }];
   }
 
-  // In production this hits our /api/generate serverless function (which proxies
-  // to Anthropic with our secret key). Works locally if you run `vercel dev`.
+  // In production this hits our /api/generate Edge function (which proxies
+  // to Anthropic with streaming + our secret key).
   const response = await fetch("/api/generate", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -190,21 +190,57 @@ Return exactly 4 recommendations. Order them best-fit first, factoring in travel
     throw new Error(`API error ${response.status}: ${errText.slice(0, 200)}`);
   }
 
-  const data = await response.json();
+  // Parse Server-Sent Events stream from Anthropic, accumulating text chunks.
+  // Anthropic's streaming format sends events like:
+  //   event: content_block_delta
+  //   data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
+  //
+  // We concatenate all text_delta pieces into a full response string.
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let fullText = "";
+  let buffer = "";
+  let charCount = 0;
 
-  const textContent = data.content
-    .filter(block => block.type === "text")
-    .map(block => block.text)
-    .join("\n");
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
 
-  const cleaned = textContent
+    buffer += decoder.decode(value, { stream: true });
+
+    // SSE events are separated by double-newline
+    const events = buffer.split("\n\n");
+    buffer = events.pop() || ""; // last piece may be incomplete
+
+    for (const evt of events) {
+      const lines = evt.split("\n");
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const data = line.slice(6).trim();
+        if (!data || data === "[DONE]") continue;
+
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.type === "content_block_delta" && parsed.delta?.type === "text_delta") {
+            fullText += parsed.delta.text;
+            charCount += parsed.delta.text.length;
+            if (onProgress) onProgress(charCount, fullText);
+          }
+        } catch (e) {
+          // Ignore malformed fragments — common during stream boundaries
+        }
+      }
+    }
+  }
+
+  const cleaned = fullText
     .replace(/```json\s*/gi, "")
     .replace(/```\s*/g, "")
     .trim();
 
   const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
   if (!jsonMatch) {
-    throw new Error("No JSON found in response");
+    throw new Error("No JSON found in streamed response");
   }
 
   const parsed = JSON.parse(jsonMatch[0]);
@@ -244,6 +280,7 @@ export default function BoisTripGenerator() {
   const [useSearch, setUseSearch] = useState(true);
   const [recs, setRecs] = useState([]);
   const [loadingText, setLoadingText] = useState("");
+  const [progressChars, setProgressChars] = useState(0);
   const [error, setError] = useState(null);
 
   // Dynamically load html2canvas for share-as-image feature
@@ -324,7 +361,8 @@ export default function BoisTripGenerator() {
       vibe: VIBES.find(v => v.id === vibe),
     };
 
-    generateRecommendations(prefs, useSearch)
+    setProgressChars(0);
+    generateRecommendations(prefs, useSearch, (chars) => setProgressChars(chars))
       .then(results => {
         clearInterval(interval);
         setLoadingText("DONE.");
@@ -503,7 +541,7 @@ export default function BoisTripGenerator() {
             <VibeStep selected={vibe} onSelect={setVibe} useSearch={useSearch} setUseSearch={setUseSearch} />
           </StepWrapper>
         )}
-        {step === 7 && <LoadingScreen text={loadingText} useSearch={useSearch} />}
+        {step === 7 && <LoadingScreen text={loadingText} useSearch={useSearch} progressChars={progressChars} />}
         {step === 8 && (
           <ResultsScreen
             recs={recs}
@@ -1191,7 +1229,12 @@ function VibeStep({ selected, onSelect, useSearch, setUseSearch }) {
 // LOADING SCREEN
 // ============================================================
 
-function LoadingScreen({ text, useSearch }) {
+function LoadingScreen({ text, useSearch, progressChars = 0 }) {
+  // Rough estimate: final output is ~3500-4500 chars. Cap display at 95% so we
+  // don't show "100%" before the JSON finishes parsing.
+  const estimatedTotal = 4000;
+  const pct = Math.min(95, Math.round((progressChars / estimatedTotal) * 100));
+
   return (
     <div style={{
       minHeight: "100vh",
@@ -1214,6 +1257,36 @@ function LoadingScreen({ text, useSearch }) {
       <div style={{ width: 80, margin: "16px 0" }}>
         <Squiggle color={PALETTE.pink} />
       </div>
+
+      {/* Streaming progress bar */}
+      {progressChars > 0 && (
+        <div style={{
+          width: 240, marginTop: 8, marginBottom: 16,
+        }}>
+          <div style={{
+            height: 10,
+            background: "white",
+            border: `2px solid ${PALETTE.black}`,
+            position: "relative", overflow: "hidden",
+          }}>
+            <div style={{
+              position: "absolute", inset: 0,
+              width: `${pct}%`,
+              background: PALETTE.pink,
+              transition: "width 0.2s ease-out",
+            }} />
+          </div>
+          <div style={{
+            marginTop: 4,
+            fontFamily: "'Space Mono', monospace",
+            fontSize: 9, letterSpacing: 2, opacity: 0.65,
+            textAlign: "center",
+          }}>
+            📡 STREAMING · {progressChars.toLocaleString()} CHARS
+          </div>
+        </div>
+      )}
+
       <div className="pulse" style={{
         marginTop: 12,
         fontFamily: "'Space Mono', monospace",
@@ -1225,7 +1298,7 @@ function LoadingScreen({ text, useSearch }) {
       }}>
         {text || "..."}
       </div>
-      {useSearch && (
+      {useSearch && progressChars === 0 && (
         <div style={{
           marginTop: 24,
           fontFamily: "'Space Mono', monospace",
@@ -1233,7 +1306,7 @@ function LoadingScreen({ text, useSearch }) {
           textAlign: "center", maxWidth: 280, lineHeight: 1.5,
         }}>
           🌐 SEARCHING THE WEB FOR REAL-TIME PICKS<br/>
-          THIS TAKES ~20-40 SECONDS
+          CLAUDE IS BROWSING — HANG TIGHT
         </div>
       )}
     </div>

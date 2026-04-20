@@ -1,54 +1,74 @@
-// Vercel Serverless Function: /api/generate
+// Vercel Edge Function: /api/generate
 //
-// This receives requests from the frontend, adds the Anthropic API key
-// (stored as a Vercel environment variable — NEVER committed to git),
-// and forwards to Anthropic's Messages API.
+// This proxies to Anthropic's Messages API with streaming enabled.
+// Edge runtime + streaming = no 60s timeout limit, and the user sees
+// progress in real-time instead of waiting for the whole response.
 //
-// Why: if we called Anthropic directly from the browser, the API key would
-// be visible to anyone who inspects network traffic. This proxy keeps it secret.
+// The API key (ANTHROPIC_API_KEY) lives only in Vercel environment variables.
 
-export default async function handler(req, res) {
-  // Lock down to POST only
+export const config = {
+  runtime: "edge",
+};
+
+export default async function handler(req) {
   if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
+    return new Response(JSON.stringify({ error: "Method not allowed" }), {
+      status: 405,
+      headers: { "Content-Type": "application/json" },
+    });
   }
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
-    return res.status(500).json({
-      error: "Server misconfigured: ANTHROPIC_API_KEY not set in Vercel environment.",
-    });
+    return new Response(
+      JSON.stringify({
+        error: "Server misconfigured: ANTHROPIC_API_KEY not set in Vercel environment.",
+      }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
   }
 
   try {
-    // Pass the body straight through. The frontend already formats it correctly
-    // (model, max_tokens, messages, optional tools).
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const body = await req.json();
+
+    // Force streaming on — this is what prevents the timeout
+    const streamingBody = { ...body, stream: true };
+
+    const upstream = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "x-api-key": apiKey,
         "anthropic-version": "2023-06-01",
       },
-      body: JSON.stringify(req.body),
+      body: JSON.stringify(streamingBody),
     });
 
-    const text = await response.text();
+    // If Anthropic returned a non-streaming error, surface it to the client
+    if (!upstream.ok) {
+      const errText = await upstream.text();
+      return new Response(errText, {
+        status: upstream.status,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
 
-    // Forward status + body back to the browser so the frontend sees the real response
-    res.status(response.status);
-    res.setHeader("Content-Type", "application/json");
-    return res.send(text);
+    // Pipe the Server-Sent Events stream straight through to the browser
+    return new Response(upstream.body, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+      },
+    });
   } catch (err) {
-    console.error("Proxy error:", err);
-    return res.status(500).json({
-      error: "Proxy failed to reach Anthropic API",
-      detail: err.message || String(err),
-    });
+    return new Response(
+      JSON.stringify({
+        error: "Proxy failed to reach Anthropic API",
+        detail: err.message || String(err),
+      }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
   }
 }
-
-// Give this function more time — Anthropic calls with web_search can take 30-60s
-export const config = {
-  maxDuration: 60,
-};
