@@ -168,7 +168,7 @@ Return ONLY valid JSON in this exact format (no markdown, no preamble, no code f
 Return exactly 4 recommendations. Order them best-fit first, factoring in travel logistics, seasonal fit, and overall vibe match.`;
 
   const requestBody = {
-    model: "claude-sonnet-4-6",
+    model: "claude-haiku-4-5",
     max_tokens: 4000,
     messages: [{ role: "user", content: prompt }],
   };
